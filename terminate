@@ -1,0 +1,65 @@
+#!/usr/bin/perl -l
+
+use lib qw(. ./lib);
+use strict;
+use warnings;
+use Getopt::Long qw(GetOptionsFromArray);
+
+use Minion::Aws::Cli;
+
+
+sub fatal
+{
+    my ($fmt, @args) = @_;
+
+    fprintf(STDERR ("terminate: " . $fmt . "\n"), @args);
+
+    exit (1);
+}
+
+sub main
+{
+    my ($line, $instance, $fleet, $region, %instances, %fleets, $verbose);
+    my (%copts);
+
+    GetOptionsFromArray(
+	\@_,
+	'v|verbose' => sub { $copts{LOG} = \*STDERR }
+	);
+
+    if (@_) {
+	fatal("unexpected operand '%'", shift(@_));
+    }
+
+    while (defined($line = <STDIN>)) {
+	chomp($line);
+
+	if ($line =~ /^(i-.*)@(.*)$/) {
+	    ($instance, $region) = ($1, $2);
+	    push(@{$instances{$region}}, $instance);
+	} elsif ($line =~ /^(sfr-.*)@(.*)$/) {
+	    ($fleet, $region) = ($1, $2);
+	    push(@{$fleets{$region}}, $fleet);
+	} else {
+	    fatal("invalid line format '%s'", $line);
+	}
+    }
+
+    foreach $region (keys(%instances)) {
+	Minion::Aws::Cli->terminate_instances(
+	    $instances{$region},
+	    REGION => $region,
+	    %copts)->get();
+    }
+
+    foreach $region (keys(%fleets)) {
+	Minion::Aws::Cli->cancel_spot_fleet_requests(
+	    $fleets{$region},
+	    REGION => $region,
+	    %copts)->get();
+    }
+}
+
+exit (main(@ARGV));
+__END__
+

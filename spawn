@@ -1,0 +1,260 @@
+#!/usr/bin/perl -l
+
+use lib qw(. ./lib);
+use strict;
+use warnings;
+use Getopt::Long qw(GetOptionsFromArray);
+use List::Util qw(sum);
+
+use Minion::Aws qw(find_images find_secgroups regions);
+use Minion::Aws::Cli;
+
+
+my $IMAGE = 'The Generated';
+my $KEY = 'gauthier';
+my $REGION = 'eu-central-1';
+my $SECGROUP = 'default';
+my $TYPE = 'c5.large';
+
+
+sub fatal
+{
+    my ($fmt, @args) = @_;
+
+    printf(STDERR ("spawn: " . $fmt . "\n"), @args);
+
+    exit (1);
+}
+
+sub get_params
+{
+    my ($imagename, $region, $verbose) = @_;
+    my (%copts, $secgroup, $image);
+
+    if ($verbose) {
+	$copts{LOG} = \*STDERR;
+    }
+
+    $secgroup = find_secgroups($SECGROUP, REGIONS => [ $region ], %copts);
+    $image = find_images($imagename, REGIONS => [ $region ], %copts);
+
+    $secgroup = $secgroup->get();
+    if (!defined($secgroup) || !defined($secgroup->{$region})) {
+	fatal("cannot find security group '%s' in region '%s'", $SECGROUP,
+	      $region);
+    }
+    $secgroup = $secgroup->{$region};
+
+    $image = $image->get();
+    if (!defined($image) && !defined($image->{$region})) {
+	fatal("cannot find image '%s' in region '%s'", $imagename, $region);
+    }
+    $image = $image->{$region};
+
+    return ($image, $secgroup);
+}
+
+sub spawn_reserved
+{
+    my ($imagename, $region, $size, $key, $type, $verbose) = @_;
+    my ($secgroup, $instances, $image, %copts);
+
+    ($image, $secgroup) = get_params($imagename, $region, $verbose);
+
+    if ($verbose) {
+	$copts{LOG} = \*STDERR;
+    }
+
+    $instances = Minion::Aws::Cli->run_instances(
+	$image->id(), $type,
+	KEY => $key,
+	QUERY => 'Instances[*].InstanceId',
+	REGION => $region,
+	SECGROUP => $secgroup,
+	SIZE => $size,
+	%copts)->get();
+    if (!defined($instances)) {
+	fatal("cannot spawn instances in region '%s'", $region);
+    }
+
+    printf("%s\n", join("\n", map { $_ . '@' . $region } @$instances));
+}
+
+sub detect_spot_issues
+{
+    my ($fleet, $region, $verbose) = @_;
+    my (%copts, $desc, $event, $err);
+
+    if ($verbose) {
+	$copts{LOG} = \*STDERR;
+    }
+
+    $desc = Minion::Aws::Cli->describe_spot_fleet_requests(
+	IDS => [ $fleet ],
+	QUERY => 'SpotFleetRequestConfigs[0].ActivityStatus',
+	REGION => $region,
+	%copts)->get();
+
+    if (!defined($desc)) {
+	return -1;
+    }
+
+    if (!grep { $desc eq $_ } qw(pending_fulfillment active)) {
+	return -1;
+    }
+
+    $desc = Minion::Aws::Cli->describe_spot_fleet_request_history(
+	$fleet, 600,
+	QUERY => 'HistoryRecords[*].EventInformation.' .
+	'{Type:EventSubType,Message:EventDescription}',
+	REGION => $region,
+	%copts)->get();
+
+    $err = 0;
+
+    foreach $event (@$desc) {
+	if (!grep { $event->{'Type'} eq $_ } qw(submitted active)) {
+	    printf(STDERR "! %s %s\n", $event->{'Type'}, $event->{'Message'});
+	    $err = -1;
+	}
+    }
+
+    return $err;
+}
+
+sub spawn_spot
+{
+    my ($imagename, $region, $size, $key, $type, $verbose) = @_;
+    my ($secgroup, $fleet, $image, %copts, $desc);
+
+    ($image, $secgroup) = get_params($imagename, $region, $verbose);
+
+    if ($verbose) {
+	$copts{LOG} = \*STDERR;
+    }
+
+    $fleet = Minion::Aws::Cli->request_spot_fleet(
+	$image->id(), $type,
+	KEY => $key,
+	REGION => $region,
+	SECGROUP => $secgroup,
+	SIZE => $size,
+	%copts)->get();
+
+    if (!defined($fleet)) {
+	fatal("cannot spawn instances in region '%s'", $region);
+    }
+
+    $fleet = $fleet->{'SpotFleetRequestId'};
+
+    while (1) {
+	$desc = Minion::Aws::Cli->describe_spot_fleet_instances(
+	    $fleet,
+	    REGION => $region,
+	    %copts)->get();
+
+	if (!defined($desc)) {
+	    last;
+	}
+	
+	if (scalar(@{$desc->{'ActiveInstances'}}) < $size) {
+	    if (detect_spot_issues($fleet, $region, $verbose)) {
+		$desc = undef;
+		last;
+	    }
+
+	    sleep(5);
+	    next;
+	}
+
+	$desc = Minion::Aws::Cli->describe_instances(
+	    IDS => [map { $_->{'InstanceId'} } @{$desc->{'ActiveInstances'}}],
+	    QUERY => 'Reservations[*].Instances[*].PublicIpAddress',
+	    REGION => $region,
+	    %copts)->get();
+
+	if (!defined($desc)) {
+	    last;
+	}
+
+	if (sum(map { scalar(@{$_}) } @$desc) < $size) {
+	    if (detect_spot_issues($fleet, $region, $verbose)) {
+		$desc = undef;
+		last;
+	    }
+
+	    sleep(5);
+	    next;
+	}
+
+	last;
+    }
+
+    if (!defined($desc)) {
+	Minion::Aws::Cli->cancel_spot_fleet_requests([ $fleet ])->get();
+	fatal("cannot spawn instances in region '%s'", $region);
+    }
+
+    printf("%s@%s\n", $fleet, $region);
+}
+
+sub main
+{
+    my ($region, $type, $size, $key, $image, $verbose, $reserved);
+
+    GetOptionsFromArray(
+	\@_,
+	'i|image=s' => \$image,
+	'k|key=s' => \$key,
+	'r|region=s' => \$region,
+	'R|reserved' => \$reserved,
+	's|size=s' => \$size,
+	't|type=s' => \$type,
+	'v|verbose' => \$verbose
+	);
+
+    if (@_) {
+	fatal("unexpected operand '%'", shift(@_));
+    }
+
+    if (!defined($image)) {
+	$image = $IMAGE;
+    }
+
+    if (!defined($key)) {
+	$key = $KEY;
+    }
+
+    if (!defined($region)) {
+	$region = $REGION;
+    } elsif (!grep { $_ eq $region } @{regions()}) {
+	fatal("unknown region '%s'", $region);
+    }
+
+    if (!defined($image)) {
+	$image = $IMAGE;
+    }
+
+    if (!defined($size)) {
+	$size = 1;
+    } elsif ($size !~ /^\d+$/) {
+	fatal("invalid size '%s'", $size);
+    } elsif ($size == 0) {
+	fatal("invalid size %d", $size);
+    }
+
+    if (!defined($type)) {
+	$type = $TYPE;
+    }
+
+    if ($reserved) {
+	spawn_reserved($image, $region, $size, $key, $type, $verbose);
+    } else {
+	spawn_spot($image, $region, $size, $key, $type, $verbose);
+    }
+
+    return 0;
+}
+
+exit (main(@ARGV));
+__END__

@@ -1,0 +1,172 @@
+#!/bin/bash
+
+set -e
+# set -x
+
+
+IDS="$1" ; shift
+ARGS="$1" ; shift
+
+TOBCAST_TYPE="$1" ; shift
+TOBCAST_BATCH="$1" ; shift
+BROKER_WORKERS="$1" ; shift
+BROKER_BATCHES="$1" ; shift
+
+MAXWAIT_RENDEZVOUS=30
+MAXWAIT_ASSETLOAD=3000
+MAXWAIT_BENCHMARK=60
+MAXWAIT_BFTSMART=60
+
+
+echo 'Gather system parameters'
+rdvip="$(cat "${IDS}" | \
+    ./run --dispatch="${ARGS}" --filter='role=rendezvous' -- echo %{ip} | \
+    cut -d' ' -f2)"
+nserver=$(cat "${IDS}" | \
+    ./run --dispatch="${ARGS}" --filter='role=server' -- echo %{ip} | wc -l)
+nbroker=$(cat "${IDS}" | \
+    ./run --dispatch="${ARGS}" --filter='role=broker' -- echo %{ip} | wc -l)
+peers="$(cat "${IDS}" | \
+    ./run --dispatch="${ARGS}" --filter='role=server' -- echo %{id} %{ip} | \
+    cut -d']' -f2- | sort -g -k1 | cut -d' ' -f3 | tr '\n' ' ')"
+
+
+DEST="brr-${TOBCAST_TYPE}_${nserver}-${TOBCAST_BATCH}_${nbroker}-${BROKER_WORKERS}-${BROKER_BATCHES}.$(date '+%Y-%m-%d-%H-%M-%S')"
+
+mkdir "${DEST}"
+
+
+echo 'Prerun cleanup'
+cat "${IDS}" | ./run -- rm '*.log' 2> '/dev/null' >&2 || true
+cat "${IDS}" | ./run -- ./killpids.sh 2> '/dev/null' || true
+
+
+print_region_ips() {
+    local role="$1" ; shift
+
+    cat "${IDS}" | ./run --dispatch="${ARGS}" --filter="role=${role}" -- \
+        echo '%{region}' '%{ip}' | perl -F'\s+' -wnl \
+          -e 'push(@{$ips{$F[3]}}, $F[4]);' \
+          -e 'END { print(join("\n", map { "  " . $_ . " " . ' \
+          -e 'join(" ", @{$ips{$_}}) } keys(%ips))) }'
+}
+
+print_now() {
+    date '+%s'
+}
+
+wait_for_line() {
+    local timeout="$1" ; shift
+    local role="$1" ; shift
+    local path="$1" ; shift
+    local success="$1" ; shift
+    local status=0
+    local now=$(print_now)
+    local start=${now}
+
+    while [ ${status} -eq 0 ] ; do
+        if cat "${IDS}" | ./run --dispatch="${ARGS}" \
+				--filter="role=${role}" -- \
+				grep -Pq "'${success}'" "${path}"
+	then
+	    status=1
+	fi
+
+	if [ ${status} -ne 0 ] ; then
+	    sleep 1
+	fi
+
+	now=$(print_now)
+	if [ $(( now - start )) -ge ${timeout} ] ; then
+	    echo 'warning: reached timeout'
+	    status=255
+	fi
+    done
+
+    if [ ${status} -eq 1 ] ; then
+	return 0
+    else
+	return 1
+    fi
+}
+
+
+case "${TOBCAST_TYPE}" in
+    'bftsmart')
+	echo 'Start BFT-SMaRt replicas'
+	print_region_ips 'server'
+	cat "${IDS}" | ./run --dispatch="${ARGS}" --filter='role=server' -- \
+            ./bftsmart.sh %{id} ${TOBCAST_BATCH} ${peers}
+	
+	echo "Wait for replicas (max = ${MAXWAIT_BFTSMART} sec)"
+	wait_for_line ${MAXWAIT_BFTSMART} 'server' 'bftsmart.log' \
+		      'Ready to process operations'
+	;;
+    'loopback')
+	;;
+    'hotstuff')
+	echo 'Start HotStuff replicas'
+	print_region_ips 'server'
+	cat "${IDS}" | ./run --dispatch="${ARGS}" --filter='role=server' -- \
+            ./hotstuff.sh %{id} ${TOBCAST_BATCH} ${peers}
+	;;
+    *)
+	echo "error: unknown tobcast '${TOBCAST_TYPE}'" >&2
+	exit 1
+	;;
+esac
+	
+echo 'Start rendezvous'
+print_region_ips 'rendezvous'
+cat "${IDS}" | ./run --dispatch="${ARGS}" --filter='role=rendezvous' -- \
+    ./podbench.sh rendezvous --servers ${nserver} --brokers ${nbroker}
+
+echo "Wait for rendezvous (max = ${MAXWAIT_RENDEZVOUS} sec)"
+wait_for_line ${MAXWAIT_RENDEZVOUS} 'rendezvous' 'podbench.log' \
+	      'Rendezvous server running'
+
+echo 'Start servers'
+print_region_ips 'server'
+cat "${IDS}" | ./run --dispatch="${ARGS}" --filter='role=server' -- \
+    ./podbench.sh server --servers ${nserver} --rendezvous="${rdvip}" \
+                         --index=%{id} --tobcast="${TOBCAST_TYPE}"
+
+echo 'Start brokers'
+print_region_ips 'broker'
+cat "${IDS}" | ./run --dispatch="${ARGS}" --filter='role=broker' -- \
+    ./podbench.sh broker --servers ${nserver} --rendezvous="${rdvip}" \
+                         --index=%{id} --workers=${BROKER_WORKERS} \
+                         --batches=${BROKER_BATCHES}
+
+echo "Wait for asset loading (max = ${MAXWAIT_ASSETLOAD} sec)"
+wait_for_line ${MAXWAIT_ASSETLOAD} 'server' 'podbench.log' \
+	      'Server running'
+
+
+echo "Wait for benchmark to complete (max = ${MAXWAIT_BENCHMARK} sec)"
+wait_for_line ${MAXWAIT_BENCHMARK} 'broker' 'podbench.log' \
+	      'Broadcasting completed' || true
+
+
+echo 'Kill all processes'
+cat "${IDS}" | ./run -- ./killpids.sh 2> '/dev/null' || true
+
+echo 'Fetch logs'
+cat "${IDS}" | ./run --scp --dispatch="${ARGS}" -- ':podbench.log' \
+		     "${DEST}/podbench.%{role}.%{ip}.log" \
+		     > '/dev/null' 2>&1 || true
+cat "${IDS}" | ./run --scp -- ':hotstuff-*.log' "${DEST}/hotstuff.%{ip}.log" \
+		     > '/dev/null' 2>&1 || true
+cat "${IDS}" | ./run --scp -- ':/proc/cpuconfig' "${DEST}/cpuconfig.%{ip}.txt"\
+		     > '/dev/null' 2>&1 || true
+
+cat "${IDS}" | \
+    ./run --dispatch="${ARGS}" -- echo "%{ip}@%{region} = %{role}:%{id}" \
+    > "${DEST}/topology.txt"
+
+for server in "${DEST}/podbench.server."*'.log' ; do
+    cat "${server}"
+done
+
+tar -czf "${DEST}.tar.gz" "${DEST}"
+rm -rf "${DEST}"

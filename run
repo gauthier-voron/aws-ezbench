@@ -1,0 +1,589 @@
+#!/usr/bin/perl -l
+
+use lib qw(. ./lib);
+use strict;
+use warnings;
+
+use Getopt::Long qw(GetOptionsFromArray);
+
+use JSON;
+
+use Minion::Aws::Cli;
+use Minion::System::Process;
+use Minion::System::Pgroup;
+
+
+my $CACHE_PATH = '.cache';
+
+
+sub fatal
+{
+    my ($fmt, @args) = @_;
+
+    printf(STDERR ("run: " . $fmt . "\n"), @args);
+
+    exit (1);
+}
+
+sub warning
+{
+    my ($fmt, @args) = @_;
+
+    printf(STDERR ("run: " . $fmt . "\n"), @args);
+}
+
+sub _get_cache
+{
+    my ($path) = @_;
+    my ($fh, $text, $cache);
+
+    if (!open($fh, '<', $path)) {
+	return {};
+    } else {
+	local $/ = undef;
+	$text = <$fh>;
+	close($fh);
+    }
+
+    $cache = JSON->new()->decode($text);
+
+    if (!defined($cache) || (ref($cache) ne 'HASH')) {
+	return {};
+    }
+
+    return $cache;
+}
+
+sub _put_cache
+{
+    my ($path, $cache) = @_;
+    my ($fh, $text);
+
+    $text = JSON->new()->encode($cache);
+
+    if (!open($fh, '>', $path)) {
+	return;
+    } else {
+	printf($fh "%s", $text);
+	close($fh);
+    }
+}
+
+sub _describe_instances_from_aws
+{
+    my ($instances, $verbose) = @_;
+    my (%copts, %requests, $region, $request, $resa, $instance, @workers);
+
+    if ($verbose) {
+	$copts{LOG} = \*STDERR;
+    }
+
+    foreach $region (keys(%$instances)) {
+	$requests{$region} = Minion::Aws::Cli->describe_instances(
+	    IDS => $instances->{$region},
+	    QUERY => 'Reservations[*].Instances[*].' .
+	             '{Id:InstanceId,Ip:PublicIpAddress}',
+	    REGION => $region,
+	    %copts);
+    }
+
+    foreach $region (keys(%requests)) {
+	$request = $requests{$region}->get();
+
+	foreach $resa (@$request) {
+	    foreach $instance (@$resa) {
+		push(@workers, {
+		    ID => $instance->{'Id'},
+		    IP => $instance->{'Ip'},
+		    REGION => $region
+		});
+	    }
+	}
+    }
+
+    return \@workers;
+}
+
+sub describe_instances
+{
+    my ($instances, $cache, $verbose) = @_;
+    my (@workers, $region, $instance, %requests, $reply, $worker);
+
+    foreach $region (keys(%$instances)) {
+	foreach $instance (@{$instances->{$region}}) {
+	    if (exists($cache->{IPS}->{$instance})) {
+		push(@workers, {
+		    ID => $instance,
+		    IP => $cache->{IPS}->{$instance},
+		    REGION => $region
+		});
+	    } else {
+		push(@{$requests{$region}}, $instance);
+	    }
+	}
+    }
+
+    $reply = _describe_instances_from_aws(\%requests, $verbose);
+
+    foreach $worker (@$reply) {
+	$cache->{IPS}->{$worker->{ID}} = $worker->{IP};
+    }
+
+    push(@workers, @$reply);
+
+    return \@workers;
+    
+}
+
+sub _describe_fleet_from_aws
+{
+    my ($fleets, $verbose) = @_;
+    my (%copts, %requests, $region, $fleet, $request, $instances, %instances);
+
+    if ($verbose) {
+	$copts{LOG} = \*STDERR;
+    }
+
+    foreach $region (keys(%$fleets)) {
+	$requests{$region}->{FLEET} =
+	    Minion::Aws::Cli->describe_spot_fleet_requests(
+		IDS => $fleets->{$region},
+		QUERY => 'SpotFleetRequestConfigs[*].{Status:ActivityStatus,' .
+		         'Size:SpotFleetRequestConfig.TargetCapacity,' .
+		         'Id:SpotFleetRequestId}',
+		REGION => $region,
+		%copts);
+
+	foreach $fleet (@{$fleets->{$region}}) {
+	    $requests{$region}->{INSTANCES}->{$fleet} = 
+		Minion::Aws::Cli->describe_spot_fleet_instances(
+		    $fleet,
+		    QUERY => 'ActiveInstances[*].InstanceId',
+		    REGION => $region,
+		    %copts);
+	}
+    }
+
+    foreach $region (keys(%requests)) {
+	$request = $requests{$region}->{FLEET}->get();
+
+	foreach $fleet (@$request) {
+	    if ($fleet->{'Status'} ne 'fulfilled') {
+		warning("degraded fleet %s@%s -> %s", $fleet->{'Id'}, $region,
+			$fleet->{'Status'});
+	    }
+
+	    $instances =
+		$requests{$region}->{INSTANCES}->{$fleet->{'Id'}}->get();
+
+	    if (scalar(@$instances) < $fleet->{'Size'}) {
+		warning("degraded fleet %s@%s -> %d/%s", $fleet->{'Id'},
+			$region, scalar(@$instances), $fleet->{'Size'});
+	    }
+	    
+	    $instances{$region}->{$fleet->{'Id'}} = $instances;
+	}
+    }
+
+    return \%instances;
+}
+
+sub describe_fleets
+{
+    my ($fleets, $cache, $verbose) = @_;
+    my (%result, $region, $fleet, %requests, $reply);
+
+    foreach $region (keys(%$fleets)) {
+	foreach $fleet (@{$fleets->{$region}}) {
+	    if (exists($cache->{FLEETS}->{$fleet})) {
+		$result{$region}->{$fleet} = $cache->{FLEETS}->{$fleet};
+	    } else {
+		push(@{$requests{$region}}, $fleet);
+	    }
+	}
+    }
+
+    $reply = _describe_fleet_from_aws(\%requests, $verbose);
+
+    foreach $region (keys(%$reply)) {
+	foreach $fleet (keys(%{$reply->{$region}})) {
+	    $result{$region}->{$fleet} = $reply->{$region}->{$fleet};
+	    $cache->{FLEETS}->{$fleet} = $reply->{$region}->{$fleet};
+	}
+    }
+
+    return \%result;
+}
+
+sub describe
+{
+    my ($instances, $fleets, $verbose) = @_;
+    my ($workers, $cache, $finstances, %irequests, $iips, $region, $fleet);
+    my (%idworkers, $index, $instance);
+
+    $cache = _get_cache($CACHE_PATH);
+
+    $finstances = describe_fleets($fleets, $cache, $verbose);
+
+    foreach $region (keys(%$finstances)) {
+	foreach $fleet (keys(%{$finstances->{$region}})) {
+	    push(@{$irequests{$region}}, @{$finstances->{$region}->{$fleet}});
+	}
+    }
+
+    foreach $region (keys(%$instances)) {
+	push(@{$irequests{$region}}, @{$instances->{$region}});
+    }
+
+    $workers = describe_instances(\%irequests, $cache, $verbose);
+
+    %idworkers = map { $_->{ID} => $_ } @$workers;
+
+    foreach $region (keys(%$finstances)) {
+	foreach $fleet (keys(%{$finstances->{$region}})) {
+	    $index = 0;
+	    foreach $instance (sort { $a cmp $b }
+			       @{$finstances->{$region}->{$fleet}}) {
+		$idworkers{$instance}->{ID} = $fleet . '[' . $index . ']';
+		$index += 1;
+	    }
+	}
+    }
+
+    _put_cache($CACHE_PATH, $cache);
+
+    return $workers;
+}
+
+sub read_dispatch
+{
+    my ($path) = @_;
+    my (%ret, $fh, $line, $section, $key, $value);
+
+    if (!open($fh, '<', $path)) {
+	fatal("cannot read dispatch '%s' : $!", $path);
+    }
+
+    while (defined($line = <$fh>)) {
+	chomp($line);
+
+	$line =~ s/#.*$//;
+	next if ($line =~ /^\s*$/);
+
+	if ($line =~ /^\s*\[\s*(\S+)\s*\]\s*$/) {
+	    $section = $1;
+	    next;
+	}
+
+	if ($line =~ /^\s*(\S+)\s*=\s*(.*\S)\s*$/) {
+	    ($key, $value) = ($1, $2);
+	    $ret{$section}->{$key} = $value;
+	}
+    }
+
+    close($fh);
+
+    return \%ret;
+}
+
+sub assign_dispatch
+{
+    my ($workers, $path) = @_;
+    my ($dispatch, $name, $key, $value, @targets, $target, $priority, $def,$i);
+
+    $dispatch = read_dispatch($path);
+
+    foreach $name (keys(%$dispatch)) {
+	while (($key, $value) = each(%{$dispatch->{$name}})) {
+	    if ($key eq '*') {
+		@targets = @$workers;
+		$priority = 0;
+	    } elsif ($key =~ /^[a-z]+-[a-z]+-\d+$/) {
+		@targets = grep { $_->{REGION} eq $key } @$workers;
+		$priority = 1;
+	    } elsif ($key =~ /^sfr-[a-z0-9-]+$/) {
+		@targets = grep { $_->{ID} =~ /$key\[\d+\]/ } @$workers;
+		$priority = 2;
+	    } elsif ($key =~ /^(sfr-[a-z0-9-]+)\[(\d+)..(\d+)\]$/) {
+		@targets = ();
+		for ($i = $2; $i <= $3; $i++) {
+		    push(@targets, grep { $_->{ID} eq ($1 . '[' . $i . ']') }
+			 @$workers);
+		}
+		$priority = 3;
+	    } elsif ($key =~ /^sfr-[a-z0-9-]+\[\d+\]$/) {
+		@targets = grep { $_->{ID} eq $key } @$workers;
+		$priority = 3;
+	    } elsif ($key =~ /^i-[a-z0-9]+$/) {
+		@targets = grep { $_->{ID} eq $key } @$workers;
+		$priority = 3;
+	    } elsif ($key =~ /^\d+\.\d+\.\d+\.\d+$/) {
+		@targets = grep { $_->{IP} eq $key } @$workers;
+		$priority = 3;
+	    } else {
+		fatal("unknown key '%s'", $key);
+	    }
+
+	    foreach $target (@targets) {
+		if (defined($target->{DISPATCH})) {
+		    $def = $target->{DISPATCH}->{$name};
+
+		    if (defined($def) && ($def->{PRIORITY} > $priority)) {
+			next;
+		    }
+
+		    if (defined($def) && ($def->{PRIORITY} == $priority)) {
+			printf(STDERR "warning: name '%s' defined twice for " .
+			       "'%s' in '%s' and '%s' in '%s'\n",
+			       $name, $def->{KEY}, $def->{SOURCE}, $key,
+			       $path);
+		    }
+		}
+
+		$target->{DISPATCH}->{$name}->{VALUE} = $value;
+		$target->{DISPATCH}->{$name}->{PRIORITY} = $priority;
+		$target->{DISPATCH}->{$name}->{SOURCE} = $path;
+		$target->{DISPATCH}->{$name}->{KEY} = $key;
+	    }
+	}
+    }
+}
+
+sub apply_dispatch
+{
+    my ($arg, $worker) = @_;
+    my ($res, $name, $value);
+
+    $res = '';
+
+    while ($arg ne '') {
+	if ($arg =~ /^%%(.*)$/) {
+	    $res .= '%';
+	    $arg = $1;
+	    next;
+	}
+
+	if ($arg =~ /^%\{([^\}]+)\}(.*)$/) {
+	    ($name, $arg) = ($1, $2);
+
+	    if (defined($value = $worker->{DISPATCH}->{$name}->{VALUE})) {
+		$res .= $value;
+	    } elsif ($name eq 'ip') {
+		$res .= $worker->{IP};
+	    } elsif ($name eq 'id') {
+		$res .= $worker->{ID};
+	    } elsif ($name eq 'region') {
+		$res .= $worker->{REGION};
+	    } else {
+		$res .= '%{' . $name . '}';
+	    }
+
+	    next;
+	}
+
+	if ($arg =~ /^([^%]+)(.*)$/) {
+	    $res .= $1;
+	    $arg = $2;
+	    next;
+	}
+
+	fatal("cannot apply dispatch '%s'", $arg);
+    }
+
+    return $res;
+}
+
+sub apply_filter
+{
+    my ($workers, $filter) = @_;
+    my ($name, $op, $value, $fn, $worker, $val, @ret);
+
+    if ($filter =~ /^([^!=~\s<>]+)([=~!<>]+)(.*)$/) {
+	($name, $op, $value) = ($1, $2, $3);
+	if (($op eq '==') || ($op eq '=')) {
+	    $fn = sub { return defined($_[0]) && ($_[0] eq $value) };
+	} elsif ($op eq '!=') {
+	    $fn = sub { return defined($_[0]) && ($_[0] ne $value) };
+	} elsif (($op eq '=~') || ($op eq '~') || ($op eq '~~')) {
+	    $fn = sub { return defined($_[0]) && ($_[0] =~ m|$value|) };
+	} elsif ($op eq '!~') {
+	    $fn = sub { return defined($_[0]) && ($_[0] !~ m|$value|) };
+	} elsif ($op eq '<') {
+	    $fn = sub { return defined($_[0]) && ($_[0] < $value) };
+	} elsif ($op eq '<=') {
+	    $fn = sub { return defined($_[0]) && ($_[0] <= $value) };
+	} elsif ($op eq '>') {
+	    $fn = sub { return defined($_[0]) && ($_[0] > $value) };
+	} elsif ($op eq '>=') {
+	    $fn = sub { return defined($_[0]) && ($_[0] > $value) };
+	} else {
+	    fatal("unknown filter operator '%s' in '%s'", $op, $filter);
+	}
+    } elsif ($filter =~ /^([^!=~\s<>]+)$/) {
+	$fn = sub { return defined($_[0]) };
+    } elsif ($filter =~ /^!([^!=~\s<>]+)$/) {
+	$fn = sub { return !defined($_[0]) };
+    } else {
+	fatal("invalid filter syntax '%s'", $filter);
+    }
+
+    foreach $worker (@$workers) {
+	if (defined($worker->{DISPATCH}->{$name})) {
+	    $val = $worker->{DISPATCH}->{$name}->{VALUE};
+	} elsif ($name eq 'ip') {
+	    $val = $worker->{IP};
+	} elsif ($name eq 'id') {
+	    $val = $worker->{ID};
+	} elsif ($name eq 'region') {
+	    $val = $worker->{REGION};
+	} else {
+	    $val = undef;
+	}
+
+	if ($fn->($val)) {
+	    push(@ret, $worker);
+	}
+    }
+
+    return \@ret;
+}
+
+sub scp
+{
+    my ($workers, $user, $args) = @_;
+    my ($group, @command, $worker, $proc, @ret);
+
+    $group = Minion::System::Pgroup->new([]);
+
+    foreach $worker (@$workers) {
+	@command = ('scp',
+		    '-o', 'StrictHostKeyChecking=no',
+		    '-o', 'UserKnownHostsFile=/dev/null',
+		    '-o', 'LogLevel=ERROR');
+
+	if (grep { -d $_ } grep { ! /^:/ }
+	    map { apply_dispatch($_, $worker) } @$args) {
+	    push(@command, '-r');
+	}
+
+	push(@command, map {
+	    if ($_ =~ /^:/) {
+		$user . '@' . $worker->{IP} . $_
+	    } else {
+		$_
+	    }
+	} map { apply_dispatch($_, $worker) } @$args);
+
+	$proc = Minion::System::Process->new(
+	    \@command,
+	    STDERR => sub { grouped_print($worker->{ID}, @_) },
+	    STDOUT => sub { grouped_print($worker->{ID}, @_) }
+	    );
+
+	$group->add($proc);
+    }
+
+    @ret = $group->waitall();
+
+    if (grep { $_->exitstatus() != 0 } @ret) {
+	return 1;
+    }
+
+    return 0;
+}
+
+sub grouped_print
+{
+    my ($id, $data) = @_;
+    my ($line);
+
+    if (!defined($data)) {
+	return;
+    }
+
+    foreach $line (split("\n", $data)) {
+	chomp($line);
+	printf("[ %-15s ] %s\n", $id, $line);
+    }
+}
+
+sub ssh
+{
+    my ($workers, $user, $args) = @_;
+    my ($group, @command, $worker, $proc, @ret);
+
+    $group = Minion::System::Pgroup->new([]);
+
+    foreach $worker (@$workers) {
+	@command = ('ssh',
+		    '-o', 'StrictHostKeyChecking=no',
+		    '-o', 'UserKnownHostsFile=/dev/null',
+		    '-o', 'LogLevel=ERROR');
+
+	push(@command, $user . '@' . $worker->{IP});
+	push(@command, map { apply_dispatch($_, $worker) } @$args);
+
+	$proc = Minion::System::Process->new(
+	    \@command,
+	    STDERR => sub { grouped_print($worker->{IP}, @_) },
+	    STDOUT => sub { grouped_print($worker->{IP}, @_) }
+	    );
+
+	$group->add($proc);
+    }
+
+    @ret = $group->waitall();
+
+    if (grep { $_->exitstatus() != 0 } @ret) {
+	return 1;
+    }
+
+    return 0;
+}
+
+sub main
+{
+    my ($line, %instances, %fleets, $region, $instance, $fleet, $ips);
+    my (@dispatches, @filters, $dispatch, $workers, $scp, $filter, $verbose);
+
+    GetOptionsFromArray(
+	\@_,
+	'c|scp' => \$scp,
+	'd|dispatch=s' => \@dispatches,
+	'f|filter=s' => \@filters,
+	'v|verbose' => \$verbose
+	);
+
+    while (defined($line = <STDIN>)) {
+	chomp($line);
+
+	if ($line =~ /^(i-.*)@(.*)$/) {
+	    ($instance, $region) = ($1, $2);
+	    push(@{$instances{$region}}, $instance);
+	} elsif ($line =~ /^(sfr-.*)@(.*)$/) {
+	    ($fleet, $region) = ($1, $2);
+	    push(@{$fleets{$region}}, $fleet);
+	} else {
+	    fatal("invalid line format '%s'", $line);
+	}
+    }
+
+    $workers = describe(\%instances, \%fleets, $verbose);
+
+    foreach $dispatch (@dispatches) {
+	assign_dispatch($workers, $dispatch);
+    }
+
+    foreach $filter (@filters) {
+	$workers = apply_filter($workers, $filter);
+    }
+
+    if ($scp) {
+	return scp($workers, 'ubuntu', [ @_ ]);
+    } else {
+	return ssh($workers, 'ubuntu', [ @_ ]);
+    }
+}
+
+exit (main(@ARGV));
+__END__
